@@ -86,10 +86,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Start Minikube
         uses: medyagh/setup-minikube@latest
-      - name: Build image inside Minikube
+      - name: Build image and load it into Minikube
         run: |
-          eval "$(minikube -p minikube docker-env)"
           docker build -t causalnews:ci .
+          minikube image load causalnews:ci
+          minikube image ls | grep causalnews
       - name: Deploy manifests
         run: |
           kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml
