@@ -1,0 +1,105 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Lint and unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint with ruff
+        run: ruff check .
+      - name: Run unit tests with coverage
+        run: pytest --cov=causalnews --cov-report=term-missing --cov-report=xml
+      - name: Evaluate model (5-fold cross-validation)
+        run: python -m causalnews evaluate
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+
+  docker:
+    name: Build Docker image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: causalnews:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test the container
+        run: |
+          docker run -d --name app -p 8000:8000 causalnews:ci
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:8000/health && break || sleep 2
+          done
+          curl -fs -X POST http://localhost:8000/analyze \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "Vaccines definitely cause autism. Share this before it is deleted!"}' \
+            | grep -q likely_fake
+          docker logs app
+          docker rm -f app
+      # Optional: publish the image to Docker Hub when secrets are configured.
+      - name: Log in to Docker Hub
+        if: github.ref == 'refs/heads/main' && vars.PUSH_TO_DOCKERHUB == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push to Docker Hub
+        if: github.ref == 'refs/heads/main' && vars.PUSH_TO_DOCKERHUB == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/causal-fake-news-analyzer:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/causal-fake-news-analyzer:${{ github.sha }}
+
+  deploy-minikube:
+    name: CD - deploy to Kubernetes (Minikube)
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@latest
+      - name: Build image inside Minikube
+        run: |
+          eval "$(minikube -p minikube docker-env)"
+          docker build -t causalnews:ci .
+      - name: Deploy manifests
+        run: |
+          kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml
+          kubectl rollout status deployment/causalnews --timeout=180s
+          kubectl get pods,svc
+      - name: Smoke-test the deployed service
+        run: |
+          URL=$(minikube service causalnews --url)
+          echo "Service URL: $URL"
+          curl -fs "$URL/health"
+          curl -fs -X POST "$URL/analyze" -H 'Content-Type: application/json' \
+            -d '{"text": "5G towers cause coronavirus and the media is hiding it!"}' \
+            | grep -q likely_fake
